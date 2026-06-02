@@ -2,49 +2,50 @@ package com.gliwka.hyperscan.util;
 
 import org.junit.jupiter.api.Test;
 
-import java.io.IOException;
 import java.lang.reflect.Field;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.fail;
 
 /**
- * Expert-level tests for ScopedPatternFilterFactory using JUnit 5 and Java 8.
- * These tests focus on the core responsibilities: lifecycle, thread-safety,
- * automatic resource reclamation, and instance isolation.
+ * Tests for {@link ScopedPatternFilterFactory}, covering its core responsibilities: per-thread
+ * caching, thread isolation, lifecycle/closure semantics, automatic cleanup of dead threads'
+ * resources, the no-filterable fast path, and input validation.
  */
 class ScopedPatternFilterFactoryTest {
 
-    // A simple, Hyperscan-compatible pattern for reliable factory initialization.
+    // A simple, Hyperscan-compatible pattern.
     private final List<Pattern> testPatterns = Collections.singletonList(Pattern.compile("test"));
 
-    // === Test Case 1: Thread-Local Caching Behavior ===
+    // === Per-thread caching ===
     @Test
-    void get_shouldReturnSameDelegateInstanceForSameThread() {
+    void get_shouldReuseTheSameDelegateForTheSameThread() {
         try (ScopedPatternFilterFactory<Pattern> factory = ScopedPatternFilterFactory.ofPatterns(testPatterns)) {
-            ScopedPatternFilter<Pattern> filter1 = factory.get();
-            ScopedPatternFilter<Pattern> filter2 = factory.get();
+            ScopedPatternFilter<Pattern> proxy1 = factory.get();
+            ScopedPatternFilter<Pattern> proxy2 = factory.get();
 
-            assertThat(filter1).isInstanceOf(ScopedPatternFilterProxy.class);
-            assertThat(filter2).isInstanceOf(ScopedPatternFilterProxy.class);
-
-            // Crucially, the underlying delegate instance must be the same.
-            assertThat(getDelegate(filter1)).isSameAs(getDelegate(filter2));
-            assertThat(factory.getThreadLocalFilters().size()).isEqualTo(1);
+            assertThat(proxy1).isInstanceOf(ScopedPatternFilterProxy.class);
+            assertThat(proxy2).isInstanceOf(ScopedPatternFilterProxy.class);
+            // The underlying thread-local instance must be reused.
+            assertThat(getDelegate(proxy1)).isSameAs(getDelegate(proxy2));
+            assertThat(factory.getRefKeeper()).hasSize(1);
         }
     }
 
-    // === Test Case 2: Thread Isolation ===
+    // === Thread isolation ===
     @Test
-    void get_shouldReturnDifferentDelegateInstancesForDifferentThreads() throws ExecutionException, InterruptedException {
+    void get_shouldCreateDistinctDelegatesForDifferentThreads() throws ExecutionException, InterruptedException {
         ExecutorService executor = Executors.newFixedThreadPool(2);
         try (ScopedPatternFilterFactory<Pattern> factory = ScopedPatternFilterFactory.ofPatterns(testPatterns)) {
             Future<ScopedPatternFilter<Pattern>> future1 = executor.submit(() -> getDelegate(factory.get()));
@@ -56,138 +57,194 @@ class ScopedPatternFilterFactoryTest {
             assertThat(delegate1).isNotNull();
             assertThat(delegate2).isNotNull();
             assertThat(delegate1).isNotSameAs(delegate2);
-            assertThat(factory.getThreadLocalFilters().size()).isEqualTo(2);
+            assertThat(factory.getRefKeeper()).hasSize(2);
         } finally {
             executor.shutdown();
         }
     }
 
-    // === Test Case 3: Explicit Close and Resource Invalidation ===
+    // === Filtering through the factory ===
     @Test
-    void close_shouldInvalidateAllActiveFiltersCreatedByIt() {
-        try (ScopedPatternFilterFactory<Pattern> factory = ScopedPatternFilterFactory.ofPatterns(testPatterns)) {
-            // Dispense a filter and confirm it works.
-            ScopedPatternFilter<Pattern> activeFilter = factory.get();
-            assertThat(activeFilter.filter("test")).isNotEmpty();
+    void get_filterShouldReturnMatchedAndIncompatibleCandidates() {
+        Pattern compatible = Pattern.compile("foobar");
+        Pattern incompatible = Pattern.compile("\\R"); // \R (linebreak) is not supported by Hyperscan
+        List<Pattern> patterns = Arrays.asList(compatible, incompatible);
 
-            // Close the factory.
-            factory.close();
+        try (ScopedPatternFilterFactory<Pattern> factory = ScopedPatternFilterFactory.ofPatterns(patterns)) {
+            ScopedPatternFilter<Pattern> filter = factory.get();
 
-            // The previously dispensed filter must now be unusable and throw an exception.
-            assertThatThrownBy(() -> activeFilter.filter("test")).isInstanceOf(IllegalStateException.class).hasMessage("Pattern filter is closed.");
+            assertThat(filter.filter("see foobar here")).containsExactlyInAnyOrder(compatible, incompatible);
+            assertThat(filter.filter("nothing here")).containsExactly(incompatible);
         }
     }
 
-    // === Test Case 4: State after Closing ===
+    // === Closure invalidates dispensed filters ===
     @Test
-    void close_shouldPreventNewFiltersFromBeingCreated() {
+    void close_shouldInvalidatePreviouslyDispensedFilters() {
+        ScopedPatternFilterFactory<Pattern> factory = ScopedPatternFilterFactory.ofPatterns(testPatterns);
+        ScopedPatternFilter<Pattern> filter = factory.get();
+        assertThat(filter.filter("test")).isNotEmpty();
+
+        factory.close();
+
+        assertThatThrownBy(() -> filter.filter("test"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("This pattern filter has already been closed.");
+    }
+
+    // === Closure prevents new filters ===
+    @Test
+    void get_shouldThrowAfterFactoryIsClosed() {
         ScopedPatternFilterFactory<Pattern> factory = ScopedPatternFilterFactory.ofPatterns(testPatterns);
         factory.close();
 
-        assertThatThrownBy(factory::get).isInstanceOf(IllegalStateException.class).hasMessage("ScopedPatternFilterFactory is closed.");
+        assertThatThrownBy(factory::get)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("This ScopedPatternFilterFactory has already been closed.");
     }
 
-    // === Test Case 5: Automatic Resource Reclamation via GC ===
+    // === Closure is idempotent ===
     @Test
-    void get_filterShouldBeCleanedUpAutomaticallyWhenItsThreadDies() throws InterruptedException {
+    void close_shouldBeIdempotent() {
+        ScopedPatternFilterFactory<Pattern> factory = ScopedPatternFilterFactory.ofPatterns(testPatterns);
+        factory.get();
+
+        factory.close();
+        assertThatCode(factory::close).doesNotThrowAnyException();
+    }
+
+    // === Factory instance isolation ===
+    @Test
+    void close_shouldNotAffectOtherFactoryInstances() {
+        List<Pattern> otherPatterns = Collections.singletonList(Pattern.compile("other"));
+        try (ScopedPatternFilterFactory<Pattern> factory1 = ScopedPatternFilterFactory.ofPatterns(testPatterns);
+             ScopedPatternFilterFactory<Pattern> factory2 = ScopedPatternFilterFactory.ofPatterns(otherPatterns)) {
+
+            ScopedPatternFilter<Pattern> filter1 = factory1.get();
+            ScopedPatternFilter<Pattern> filter2 = factory2.get();
+
+            factory1.close();
+
+            assertThatThrownBy(() -> filter1.filter("test")).isInstanceOf(IllegalStateException.class);
+            // The second factory remains fully operational.
+            assertThat(factory2.get()).isNotNull();
+            assertThat(filter2.filter("other")).isNotEmpty();
+        }
+    }
+
+    // === Proxy close is a no-op ===
+    @Test
+    void get_shouldReturnProxyWhoseCloseIsANoOp() throws Exception {
         try (ScopedPatternFilterFactory<Pattern> factory = ScopedPatternFilterFactory.ofPatterns(testPatterns)) {
-            // Step 1: Create a filter in a new thread, which then terminates.
-            Thread ephemeralThread = new Thread(factory::get);
-            ephemeralThread.start();
-            ephemeralThread.join(); // Wait for the thread to die.
+            ScopedPatternFilter<Pattern> proxy = factory.get();
+            ScopedPatternFilter<Pattern> delegate = getDelegate(proxy);
 
-            // At this point, the factory is tracking the created filter and its cleaner.
-            assertThat(factory.getRefKeeper().size()).isEqualTo(1);
-            assertThat(factory.getThreadLocalFilters().size()).isEqualTo(1);
+            proxy.close();
 
-            // Step 2: Make the Thread object unreachable to allow it to be GC'd.
-            // noinspection UnusedAssignment
-            ephemeralThread = null;
-            factory.getThreadLocalFilters().clear();
+            // The underlying delegate must remain usable.
+            assertThat(delegate.filter("test")).isNotEmpty();
+        }
+    }
 
-            // Step 3: Repeatedly suggest GC and wait for the factory's background cleaner task
-            // to process the phantom reference and remove it from the tracking set.
-            long timeout = System.currentTimeMillis() + 5000; // 5-second timeout
-            boolean wasCleaned = false;
-            while (System.currentTimeMillis() < timeout) {
+    // === No-filterable fast path ===
+    @Test
+    void get_whenNoPatternIsFilterable_shouldReturnPatternOnlyFilter() {
+        // Only Hyperscan-incompatible patterns (\R, \b{3}) => no database is compiled.
+        List<Pattern> incompatible = Arrays.asList(Pattern.compile("\\R"), Pattern.compile("a\\b{3}"));
+        try (ScopedPatternFilterFactory<Pattern> factory = ScopedPatternFilterFactory.ofPatterns(incompatible)) {
+            ScopedPatternFilter<Pattern> filter = factory.get();
+
+            assertThat(filter).isInstanceOf(PatternOnlyFilter.class);
+            assertThat(filter.filter("anything")).containsExactlyInAnyOrderElementsOf(incompatible);
+            // No filter implementations were created, so nothing is tracked for cleanup.
+            assertThat(factory.getRefKeeper()).isEmpty();
+        }
+    }
+
+    // === Automatic cleanup when a thread dies ===
+    @Test
+    void get_shouldAutomaticallyReclaimResourcesWhenItsThreadDies() throws InterruptedException {
+        try (ScopedPatternFilterFactory<Pattern> factory = ScopedPatternFilterFactory.ofPatterns(testPatterns)) {
+            // Create a filter on a short-lived thread, then let the thread terminate.
+            Thread ephemeral = new Thread(factory::get);
+            ephemeral.start();
+            ephemeral.join();
+
+            assertThat(factory.getRefKeeper()).hasSize(1);
+
+            // Make the Thread (and thus its thread-local filter) collectable.
+            //noinspection UnusedAssignment
+            ephemeral = null;
+
+            long deadline = System.currentTimeMillis() + 5000;
+            boolean cleaned = false;
+            while (System.currentTimeMillis() < deadline) {
                 System.gc();
                 if (factory.getRefKeeper().isEmpty()) {
-                    wasCleaned = true;
+                    cleaned = true;
                     break;
                 }
                 Thread.sleep(200);
             }
 
-            if (!wasCleaned) {
-                fail("Automatic resource cleanup failed: refKeeper was not cleared within the timeout.");
+            if (!cleaned) {
+                fail("Automatic cleanup did not drain refKeeper within the timeout.");
             }
         }
     }
 
-    // === Test Case 6: Factory Instance Isolation ===
+    // === Input validation ===
     @Test
-    void close_shouldHaveNoEffectOnOtherFactoryInstances() {
-        List<Pattern> patterns2 = Collections.singletonList(Pattern.compile("other"));
+    void ofPatterns_shouldRejectNullIterable() {
+        assertThatThrownBy(() -> ScopedPatternFilterFactory.ofPatterns(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("The patterns iterable must not be null.");
+    }
 
-        try (ScopedPatternFilterFactory<Pattern> factory1 = ScopedPatternFilterFactory.ofPatterns(testPatterns); ScopedPatternFilterFactory<Pattern> factory2 = ScopedPatternFilterFactory.ofPatterns(patterns2)) {
+    @Test
+    void ofPatterns_shouldRejectEmptyIterable() {
+        assertThatThrownBy(() -> ScopedPatternFilterFactory.ofPatterns(Collections.emptyList()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("At least one pattern must be provided; the patterns iterable was empty.");
+    }
 
-            ScopedPatternFilter<Pattern> filter1 = factory1.get();
-            ScopedPatternFilter<Pattern> filter2 = factory2.get();
+    @Test
+    void create_shouldRejectNullPatternMapper() {
+        assertThatThrownBy(() -> ScopedPatternFilterFactory.create(testPatterns, null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("The patternMapper function must not be null.");
+    }
 
-            // Close the first factory.
-            factory1.close();
+    @Test
+    void create_shouldRejectMapperReturningNull() {
+        List<String> sources = Collections.singletonList("ignored");
+        Function<String, Pattern> nullMapper = s -> null;
 
-            // Verify the second factory and its filter remain fully operational.
-            assertThat(factory2.get()).isNotNull();
-            assertThat(filter2.filter("other")).isNotEmpty();
+        assertThatThrownBy(() -> ScopedPatternFilterFactory.create(sources, nullMapper))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("The patternMapper returned null for pattern: ignored.");
+    }
 
-            // Verify the first factory's filter is now dead.
-            assertThatThrownBy(() -> filter1.filter("test")).isInstanceOf(IllegalStateException.class);
+    @Test
+    void create_shouldSupportArbitrarySourceTypesViaMapper() {
+        List<String> sources = Arrays.asList("foobar", "widget");
+        try (ScopedPatternFilterFactory<String> factory = ScopedPatternFilterFactory.create(sources, Pattern::compile)) {
+            assertThat(factory.get().filter("see foobar here")).containsExactly("foobar");
         }
     }
 
-    // === Test Case 7: Proxy Behavior Verification ===
-    @Test
-    void get_returnsProxyWhoseCloseMethodIsANoOp() throws IOException {
-        try (ScopedPatternFilterFactory<Pattern> factory = ScopedPatternFilterFactory.ofPatterns(testPatterns)) {
-            ScopedPatternFilter<Pattern> proxy = factory.get();
-            ScopedPatternFilter<Pattern> delegate = getDelegate(proxy);
-
-            // Calling close on the proxy should do nothing.
-            proxy.close();
-
-            // The underlying delegate should remain active and usable.
-            assertThat(delegate.filter("test")).isNotEmpty();
-        }
-    }
-
-    // === Test Case 8: Constructor Input Validation ===
-    @Test
-    void constructor_shouldRejectInvalidInputs() {
-        // Null patterns iterable
-        assertThatThrownBy(() -> ScopedPatternFilterFactory.ofPatterns(null)).isInstanceOf(NullPointerException.class).hasMessage("patterns cannot be null");
-
-        // Empty patterns iterable
-        assertThatThrownBy(() -> ScopedPatternFilterFactory.ofPatterns(Collections.emptyList())).isInstanceOf(IllegalArgumentException.class).hasMessage("patterns cannot be empty");
-
-        // Null pattern mapper
-        assertThatThrownBy(() -> new ScopedPatternFilterFactory<>(testPatterns, null)).isInstanceOf(NullPointerException.class).hasMessage("patternMapper cannot be null");
-    }
-
-    /**
-     * Helper method to extract the underlying delegate from the proxy via reflection for testing.
-     */
+    /** Extracts the wrapped delegate from a {@link ScopedPatternFilterProxy} via reflection. */
     @SuppressWarnings("unchecked")
-    private ScopedPatternFilter<Pattern> getDelegate(ScopedPatternFilter<Pattern> proxy) {
+    private static ScopedPatternFilter<Pattern> getDelegate(ScopedPatternFilter<Pattern> proxy) {
+        if (!(proxy instanceof ScopedPatternFilterProxy)) {
+            throw new IllegalArgumentException("Expected a proxy, but got " + proxy.getClass().getName());
+        }
         try {
-            if (!(proxy instanceof ScopedPatternFilterProxy)) {
-                throw new IllegalArgumentException("Expected a proxy instance, but got " + proxy.getClass().getName());
-            }
             Field delegateField = ScopedPatternFilterProxy.class.getDeclaredField("delegate");
             delegateField.setAccessible(true);
             return (ScopedPatternFilter<Pattern>) delegateField.get(proxy);
         } catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException("Failed to get delegate via reflection", e);
+            throw new RuntimeException("Failed to read proxy delegate via reflection", e);
         }
     }
 }

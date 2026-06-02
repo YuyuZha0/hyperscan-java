@@ -1,21 +1,19 @@
 package com.gliwka.hyperscan.util;
 
-import com.github.benmanes.caffeine.cache.Caffeine;
-import com.github.benmanes.caffeine.cache.RemovalCause;
 import com.gliwka.hyperscan.wrapper.CompileErrorException;
+import com.gliwka.hyperscan.wrapper.Database;
+import com.gliwka.hyperscan.wrapper.Expression;
 import lombok.AccessLevel;
 import lombok.Getter;
 
 import java.io.Closeable;
-import java.io.IOException;
 import java.lang.ref.ReferenceQueue;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -92,52 +90,111 @@ public final class ScopedPatternFilterFactory<T> implements Supplier<ScopedPatte
     private final ReferenceQueue<ScopedPatternFilter<?>> referenceQueue = new ReferenceQueue<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    /**
-     * This set holds strong references to the PatternFilterCleaner objects.
-     * This is necessary because if the PhantomReference objects themselves were only weakly
-     * reachable, they could be garbage collected before they are enqueued, and the
-     * cleanup logic would never run.
-     */
     @Getter(AccessLevel.PACKAGE)
     @SuppressWarnings("MismatchedQueryAndUpdateOfCollection")
-    private final Set<PatternFilterCleaner> refKeeper = ConcurrentHashMap.newKeySet();
+    private final Set<PatternFilterCleaner> refKeeper = Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
+
+    private final ScheduledFuture<?> cleanerTaskFuture; // Handle to this instance's cleanup task.
+    private final Database database;
+    private final List<T> filterable;
+    private final List<T> notFilterable;
 
     @Getter(AccessLevel.PACKAGE)
-    private final ConcurrentMap<Thread, ScopedPatternFilter<T>> threadLocalFilters = Caffeine.newBuilder().weakKeys().removalListener(this::handleRemoval).build().asMap();
-    private final ScheduledFuture<?> cleanerTaskFuture; // Handle to this instance's cleanup task.
-    private final List<T> patterns;
-    private final Function<? super T, ? extends Pattern> patternMapper;
+    private final ThreadLocal<ScopedPatternFilter<T>> threadLocalFilters = ThreadLocal.withInitial(this::createFilter);
 
-    public ScopedPatternFilterFactory(Iterable<T> patterns, Function<? super T, ? extends Pattern> patternMapper) {
-        Objects.requireNonNull(patternMapper, "patternMapper cannot be null");
-        Objects.requireNonNull(patterns, "patterns cannot be null");
-        this.patterns = new ArrayList<>();
-        for (T pattern : patterns) {
-            Objects.requireNonNull(pattern, "patterns cannot contain null elements");
-            this.patterns.add(pattern);
-        }
-        if (this.patterns.isEmpty()) {
-            throw new IllegalArgumentException("patterns cannot be empty");
-        }
-        this.patternMapper = patternMapper;
-
+    private ScopedPatternFilterFactory(Database database, List<T> filterable, List<T> notFilterable) {
+        this.database = database;
+        this.filterable = filterable;
+        this.notFilterable = notFilterable;
         // Schedule this instance's cleanup task on the shared executor.
         this.cleanerTaskFuture = ExecutorHolder.CLEANER_SERVICE.scheduleWithFixedDelay(this::cleanUp, 1, 1, TimeUnit.SECONDS);
     }
 
-    public static ScopedPatternFilterFactory<Pattern> ofPatterns(Iterable<Pattern> patterns) {
-        return new ScopedPatternFilterFactory<>(patterns, Function.identity());
+    private ScopedPatternFilterFactory(List<T> notFilterable) {
+        this.database = null;
+        this.filterable = Collections.emptyList();
+        this.notFilterable = notFilterable;
+        // Schedule this instance's cleanup task on the shared executor.
+        this.cleanerTaskFuture = null; // No cleanup needed since there are no filter instances.
     }
 
-    private void handleRemoval(Thread thread, ScopedPatternFilter<T> filter, RemovalCause cause) {
-        if (filter != null) {
-            try {
-                filter.close();
-            } catch (IOException e) {
-                // Log this error.
+    /**
+     * Creates a factory for the given collection of arbitrary objects, deriving a
+     * {@link Pattern} from each via {@code patternMapper}.
+     *
+     * <p>Each pattern is classified as either <i>filterable</i> (compatible with Hyperscan's
+     * prefilter mode) or <i>not filterable</i> (e.g. it uses unsupported constructs such as
+     * lookarounds). The filterable patterns are compiled once into a single shared Hyperscan
+     * {@link Database}; the non-filterable patterns are always returned as candidates by
+     * {@link ScopedPatternFilter#filter(String)}, since this filter cannot rule them out.
+     *
+     * @param patterns      the source objects to filter; must not be {@code null} and must
+     *                      yield at least one element
+     * @param patternMapper maps each source object to the {@link Pattern} used for matching;
+     *                      must not be {@code null} and must not return {@code null}
+     * @param <T>           the type of the source objects
+     * @return a factory ready to dispense thread-safe filters for the given patterns
+     * @throws NullPointerException     if {@code patterns} or {@code patternMapper} is
+     *                                  {@code null}, or if {@code patternMapper} returns
+     *                                  {@code null} for any element
+     * @throws IllegalArgumentException if {@code patterns} is empty
+     * @throws RuntimeException         if the filterable patterns fail to compile into a
+     *                                  Hyperscan database
+     */
+    public static <T> ScopedPatternFilterFactory<T> create(Iterable<T> patterns, Function<? super T, ? extends Pattern> patternMapper) {
+        Objects.requireNonNull(patternMapper, "The patternMapper function must not be null.");
+        Objects.requireNonNull(patterns, "The patterns iterable must not be null.");
+
+        List<Expression> expressions = new ArrayList<>();
+        List<T> notFilterable = new ArrayList<>();
+        List<T> filterable = new ArrayList<>();
+
+        for (T pattern : patterns) {
+            Pattern p = patternMapper.apply(pattern);
+            Objects.requireNonNull(p, "The patternMapper returned null for pattern: " + pattern + ".");
+            Expression expression = ExpressionUtil.mapToExpression(p, filterable.size());
+
+            if (expression == null) {
+                // can't be compiled to expression -> not filterable
+                notFilterable.add(pattern);
+            } else {
+                expressions.add(expression);
+                filterable.add(pattern);
             }
         }
+
+        if (filterable.isEmpty() && notFilterable.isEmpty()) {
+            throw new IllegalArgumentException("At least one pattern must be provided; the patterns iterable was empty.");
+        }
+
+        if (!filterable.isEmpty()) {
+            try {
+                Database database = Database.compile(expressions);
+                return new ScopedPatternFilterFactory<>(database, filterable, notFilterable);
+            } catch (CompileErrorException e) {
+                throw new RuntimeException("Failed to compile the provided patterns into a Hyperscan database.", e);
+            }
+        } else {
+            // No filterable patterns, so we can skip creating a Database and just return a factory with
+            // notFilterable patterns.
+            return new ScopedPatternFilterFactory<>(notFilterable);
+        }
     }
+
+    /**
+     * Convenience factory for a collection of {@link Pattern} objects. Equivalent to
+     * {@link #create(Iterable, Function)} with the identity mapper.
+     *
+     * @param patterns the patterns to filter; must not be {@code null} and must not be empty
+     * @return a factory ready to dispense thread-safe filters for the given patterns
+     * @throws NullPointerException     if {@code patterns} is {@code null}
+     * @throws IllegalArgumentException if {@code patterns} is empty
+     * @throws RuntimeException         if the patterns fail to compile into a Hyperscan database
+     */
+    public static ScopedPatternFilterFactory<Pattern> ofPatterns(Iterable<Pattern> patterns) {
+        return create(patterns, Function.identity());
+    }
+
 
     // This is an instance method that knows about this instance's queue and refKeeper.
     private void cleanUp() {
@@ -152,53 +209,74 @@ public final class ScopedPatternFilterFactory<T> implements Supplier<ScopedPatte
         }
     }
 
-    private void ensureOpen() {
-        if (closed.get()) {
-            throw new IllegalStateException("ScopedPatternFilterFactory is closed.");
-        }
-    }
-
     private ScopedPatternFilter<T> createFilter() {
-        ensureOpen();
-        try {
-            ScopedPatternFilterImpl<T> filter = new ScopedPatternFilterImpl<>(patterns, patternMapper);
-            // Use this instance's referenceQueue.
-            PatternFilterCleaner cleaner = new PatternFilterCleaner(filter, referenceQueue);
-            refKeeper.add(cleaner);
-            return filter;
-        } catch (CompileErrorException e) {
-            throw new RuntimeException("Failed to compile patterns into ScopedPatternFilter", e);
+        if (database == null) {
+            return null;
         }
+        ScopedPatternFilterImpl<T> filter = new ScopedPatternFilterImpl<>(database, closed, filterable, notFilterable);
+        // Use this instance's referenceQueue.
+        PatternFilterCleaner cleaner = new PatternFilterCleaner(filter, referenceQueue);
+        refKeeper.add(cleaner);
+        return filter;
     }
 
+    /**
+     * Returns a {@link ScopedPatternFilter} bound to the calling thread. The first call on a
+     * given thread lazily creates that thread's filter (allocating its own Hyperscan scanner and
+     * scratch space over the shared database); subsequent calls on the same thread reuse it.
+     *
+     * <p>The returned value is a lightweight, non-closeable proxy: calling {@link
+     * ScopedPatternFilter#close()} on it is a no-op, so it is safe to use in a
+     * try-with-resources block without accidentally tearing down the shared thread-local
+     * instance. The underlying filter's lifetime is managed by this factory — explicitly via
+     * {@link #close()}, or automatically once the owning thread dies and is garbage collected.
+     *
+     * @return a thread-safe filter for the current thread
+     * @throws IllegalStateException if this factory has already been closed
+     */
     @Override
     public ScopedPatternFilter<T> get() {
-        ensureOpen();
-        ScopedPatternFilter<T> filter = threadLocalFilters.computeIfAbsent(Thread.currentThread(), t -> createFilter());
+        if (closed.get()) {
+            throw new IllegalStateException("This ScopedPatternFilterFactory has already been closed.");
+        }
+        if (database == null) {
+            // No filterable patterns, so just return a simple filter that returns notFilterable patterns.
+            return new PatternOnlyFilter<>(notFilterable);
+        }
+        ScopedPatternFilter<T> filter = threadLocalFilters.get();
         return new ScopedPatternFilterProxy<>(filter);
     }
 
+    /**
+     * Releases all native resources held by this factory: it cancels the background cleanup
+     * task, closes every live thread-local scanner (waiting out any in-flight scan), and frees
+     * the shared Hyperscan database. After this call, {@link #get()} throws and any previously
+     * dispensed filter throws on use.
+     *
+     * <p>This method is idempotent; only the first invocation performs work. Failing to close a
+     * factory that compiled a database leaks native memory, so it <b>must</b> be called when the
+     * factory is no longer needed.
+     */
     @Override
     public void close() {
         if (closed.compareAndSet(false, true)) {
-
-            // 1. Explicitly close all still-active filter instances.
-            for (Map.Entry<Thread, ScopedPatternFilter<T>> entry : threadLocalFilters.entrySet()) {
-                try {
-                    entry.getValue().close();
-                } catch (IOException e) {
-                    // Log this error.
-                }
+            if (cleanerTaskFuture != null) {
+                this.cleanerTaskFuture.cancel(false);
             }
-
-            // 2. Clear the map to release references.
-            threadLocalFilters.clear();
-
-            // 3. Cancel this instance's scheduled cleanup task.
-            // Other factory instances' tasks on the shared executor are unaffected.
-            this.cleanerTaskFuture.cancel(false);
-
-            // 4. Perform a final cleanup pass and clear the reference keeper.
+            // Close every live filter's scanner before freeing the shared database. Each close action
+            // synchronizes on its scanner, so it waits out any in-flight scan (and the closed flag set
+            // above blocks new ones) — guaranteeing no scan can touch the database once we free it.
+            PatternFilterCleaner[] cleaners;
+            synchronized (refKeeper) {
+                cleaners = refKeeper.toArray(new PatternFilterCleaner[0]);
+            }
+            for (PatternFilterCleaner cleaner : cleaners) {
+                cleaner.clean();
+            }
+            // All scanners (and their scratch) are now closed; release the shared native database.
+            if (database != null) {
+                database.close();
+            }
             cleanUp();
             refKeeper.clear();
         }

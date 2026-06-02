@@ -11,6 +11,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * Tests for {@link ScopedPatternFilterProxy}: it must forward filtering to its delegate while
+ * making {@link ScopedPatternFilterProxy#close()} a no-op, since the delegate's lifetime is owned
+ * by the factory.
+ */
 class ScopedPatternFilterProxyTest {
 
     private FakeDelegateFilter<String> delegate;
@@ -23,76 +28,69 @@ class ScopedPatternFilterProxyTest {
     }
 
     @Test
-    void filter_shouldDelegateCallToWrappedInstance() {
-        String input = "test data";
-        List<String> expectedResult = Collections.singletonList("match");
-        delegate.setNextResult(expectedResult);
+    void filter_shouldDelegateToWrappedInstance() {
+        List<String> expected = Collections.singletonList("match");
+        delegate.setNextResult(expected);
 
-        List<String> actualResult = proxy.filter(input);
+        List<String> actual = proxy.filter("input");
 
-        assertThat(actualResult).isSameAs(expectedResult);
+        assertThat(actual).isSameAs(expected);
         assertThat(delegate.getFilterCallCount()).isEqualTo(1);
-        assertThat(delegate.getLastFilteredInput()).isEqualTo(input);
+        assertThat(delegate.getLastInput()).isEqualTo("input");
     }
 
     @Test
-    void apply_shouldDelegateToFilterMethod() {
-        String input = "test data";
-        List<String> expectedResult = Collections.singletonList("match");
-        delegate.setNextResult(expectedResult);
+    void apply_shouldDelegateToFilter() {
+        List<String> expected = Collections.singletonList("match");
+        delegate.setNextResult(expected);
 
-        List<String> actualResult = proxy.apply(input);
+        List<String> actual = proxy.apply("input");
 
-        assertThat(actualResult).isSameAs(expectedResult);
+        assertThat(actual).isSameAs(expected);
         assertThat(delegate.getFilterCallCount()).isEqualTo(1);
-        assertThat(delegate.getLastFilteredInput()).isEqualTo(input);
+        assertThat(delegate.getLastInput()).isEqualTo("input");
     }
 
     @Test
-    void close_shouldBeANoOpAndNotCallCloseOnDelegate() {
-        // The proxy's purpose is to prevent users from closing the underlying
-        // thread-local filter instance, which is managed by the factory.
+    void close_shouldBeNoOpAndNotCloseDelegate() throws IOException {
         proxy.close();
 
         assertThat(delegate.isClosed()).isFalse();
     }
 
-    /**
-     * A fake ScopedPatternFilter that records interactions for verification.
-     */
-    private static class FakeDelegateFilter<T> implements ScopedPatternFilter<T> {
+    /** Records interactions for verification. */
+    private static final class FakeDelegateFilter<T> implements ScopedPatternFilter<T> {
         private final AtomicInteger filterCallCount = new AtomicInteger(0);
         private final AtomicBoolean closed = new AtomicBoolean(false);
         private List<T> nextResult = Collections.emptyList();
-        private String lastFilteredInput;
+        private String lastInput;
 
         @Override
         public List<T> filter(String input) {
-            this.lastFilteredInput = input;
+            this.lastInput = input;
             filterCallCount.incrementAndGet();
             return nextResult;
         }
 
         @Override
-        public void close() throws IOException {
+        public void close() {
             closed.set(true);
         }
 
-        // --- Test helper methods ---
-        public int getFilterCallCount() {
+        int getFilterCallCount() {
             return filterCallCount.get();
         }
 
-        public boolean isClosed() {
+        boolean isClosed() {
             return closed.get();
         }
 
-        public void setNextResult(List<T> nextResult) {
+        void setNextResult(List<T> nextResult) {
             this.nextResult = nextResult;
         }
 
-        public String getLastFilteredInput() {
-            return lastFilteredInput;
+        String getLastInput() {
+            return lastInput;
         }
     }
 }

@@ -1,40 +1,47 @@
 package com.gliwka.hyperscan.util;
 
+import com.gliwka.hyperscan.wrapper.Database;
+import com.gliwka.hyperscan.wrapper.Expression;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
-import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
-import java.util.function.Function;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 
+import static java.util.Arrays.asList;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Tests for ScopedPatternFilterImpl.
+ * Tests for {@link ScopedPatternFilterImpl}.
  * <p>
- * NOTE: These tests require at least one Hyperscan-compatible pattern to successfully
- * initialize the underlying Hyperscan database. By mixing compatible and incompatible
- * patterns, we can test the filtering logic without mocking.
+ * The implementation operates over a pre-compiled, shared {@link Database} owned by the factory.
+ * These tests build that database directly so the impl can be exercised in isolation, mixing one
+ * Hyperscan-compatible pattern with one incompatible pattern to cover both candidate sources.
  */
 class ScopedPatternFilterImplTest {
 
-    // A simple pattern that is compatible with Hyperscan.
+    // Compatible with Hyperscan's prefilter mode.
     private final Pattern compatiblePattern = Pattern.compile("foobar");
-    // A pattern with a lookbehind, which is not supported by Hyperscan.
-    private final Pattern incompatiblePattern = Pattern.compile("a++");
+    // \R (any Unicode linebreak) is not supported by Hyperscan, so it is always a candidate.
+    private final Pattern incompatiblePattern = Pattern.compile("\\R");
 
+    private final List<Pattern> filterable = Collections.singletonList(compatiblePattern);
+    private final List<Pattern> notFilterable = Collections.singletonList(incompatiblePattern);
+
+    private final AtomicBoolean databaseClosed = new AtomicBoolean(false);
+    private Database database;
     private ScopedPatternFilterImpl<Pattern> filter;
 
     @BeforeEach
     void setUp() throws Exception {
-        // Initialize with a mix of patterns. This ensures the Hyperscan database
-        // can be compiled with at least one valid expression.
-        List<Pattern> allPatterns = Arrays.asList(compatiblePattern, incompatiblePattern);
-        filter = new ScopedPatternFilterImpl<>(allPatterns, Function.identity());
+        Expression expression = ExpressionUtil.mapToExpression(compatiblePattern, 0);
+        database = Database.compile(Collections.singletonList(expression));
+        filter = new ScopedPatternFilterImpl<>(database, databaseClosed, filterable, notFilterable);
     }
 
     @AfterEach
@@ -42,40 +49,88 @@ class ScopedPatternFilterImplTest {
         if (filter != null) {
             filter.close();
         }
+        if (database != null) {
+            database.close();
+        }
     }
 
     @Test
-    void filter_whenMatchOccurs_shouldReturnMatchingPatternAndAllIncompatiblePatterns() {
+    void filter_whenMatchOccurs_shouldReturnMatchedAndIncompatiblePatterns() {
         List<Pattern> result = filter.filter("some text with foobar inside");
 
-        // Expecting the pattern that matched ("foobar") AND the pattern that couldn't be filtered.
+        // The matched compatible pattern plus the always-included incompatible pattern.
         assertThat(result).containsExactlyInAnyOrder(compatiblePattern, incompatiblePattern);
     }
 
     @Test
     void filter_whenNoMatchOccurs_shouldReturnOnlyIncompatiblePatterns() {
-        List<Pattern> result = filter.filter("some text with no matches");
+        List<Pattern> result = filter.filter("nothing of interest here");
 
-        // No compatible patterns matched, so we only get the fallback "not filterable" pattern.
-        // This is the corrected test for the previously failing logic.
         assertThat(result).containsExactly(incompatiblePattern);
     }
 
     @Test
-    void filter_shouldThrowIllegalStateExceptionIfClosed() throws IOException {
-        filter.close();
-
-        assertThatThrownBy(() -> filter.filter("some input")).isInstanceOf(IllegalStateException.class).hasMessage("Pattern filter is closed.");
+    void filter_shouldRejectNullInput() {
+        assertThatThrownBy(() -> filter.filter(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("The input string must not be null.");
     }
 
     @Test
-    void getCloseAction_shouldReturnRunnableThatClosesFilter() {
+    void filter_shouldThrowWhenFilterIsClosed() throws IOException {
+        filter.close();
+
+        assertThatThrownBy(() -> filter.filter("foobar"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("This pattern filter has already been closed.");
+    }
+
+    @Test
+    void filter_shouldThrowWhenBackingDatabaseIsClosed() {
+        databaseClosed.set(true);
+
+        assertThatThrownBy(() -> filter.filter("foobar"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("The backing ScopedPatternFilterFactory has already been closed.");
+    }
+
+    @Test
+    void getCloseAction_shouldReturnRunnableThatClosesTheFilter() {
         Runnable closeAction = filter.getCloseAction();
 
-        // Run the close action
         closeAction.run();
 
-        // After running, the filter should be closed
-        assertThatThrownBy(() -> filter.filter("test")).isInstanceOf(IllegalStateException.class).hasMessage("Pattern filter is closed.");
+        assertThatThrownBy(() -> filter.filter("foobar"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("This pattern filter has already been closed.");
+    }
+
+    @Test
+    void getCloseAction_shouldBeIdempotent() {
+        Runnable closeAction = filter.getCloseAction();
+
+        closeAction.run();
+        // A second run (e.g. close() followed by the cleaner firing) must not throw.
+        closeAction.run();
+
+        assertThatThrownBy(() -> filter.filter("foobar"))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void filter_withNonMatchingFilterablePattern_isReportedByHyperscan() throws Exception {
+        // A second compatible pattern that does not match the input is correctly excluded,
+        // proving the result reflects actual Hyperscan matches rather than all filterable patterns.
+        Pattern other = Pattern.compile("widget");
+        List<Pattern> twoFilterable = asList(compatiblePattern, other);
+        Database db = Database.compile(asList(
+                ExpressionUtil.mapToExpression(compatiblePattern, 0),
+                ExpressionUtil.mapToExpression(other, 1)));
+        try (ScopedPatternFilterImpl<Pattern> f =
+                     new ScopedPatternFilterImpl<>(db, new AtomicBoolean(false), twoFilterable, Collections.emptyList())) {
+            assertThat(f.filter("only foobar here")).containsExactly(compatiblePattern);
+        } finally {
+            db.close();
+        }
     }
 }
