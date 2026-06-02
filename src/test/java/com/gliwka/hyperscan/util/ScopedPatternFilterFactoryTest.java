@@ -6,10 +6,12 @@ import java.lang.reflect.Field;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 
@@ -190,6 +192,43 @@ class ScopedPatternFilterFactoryTest {
             if (!cleaned) {
                 fail("Automatic cleanup did not drain refKeeper within the timeout.");
             }
+        }
+    }
+
+    // === Concurrency: get() racing close() must never use a freed database ===
+    @Test
+    void get_concurrentWithClose_neverCrashesAndEventuallyRejects() throws InterruptedException {
+        // Repeatedly race fresh threads calling get() against close() on the same factory. A
+        // use-after-free of the shared database would crash the JVM; otherwise every call must
+        // either return a usable filter or fail cleanly with IllegalStateException.
+        for (int round = 0; round < 50; round++) {
+            ScopedPatternFilterFactory<Pattern> factory = ScopedPatternFilterFactory.ofPatterns(testPatterns);
+            int racers = 8;
+            CountDownLatch start = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(racers);
+            AtomicReference<Throwable> unexpected = new AtomicReference<>();
+
+            for (int i = 0; i < racers; i++) {
+                new Thread(() -> {
+                    try {
+                        start.await();
+                        ScopedPatternFilter<Pattern> filter = factory.get();
+                        filter.filter("test");
+                    } catch (IllegalStateException expected) {
+                        // Acceptable: the factory was closed before/while we created our filter.
+                    } catch (Throwable t) {
+                        unexpected.compareAndSet(null, t);
+                    } finally {
+                        done.countDown();
+                    }
+                }).start();
+            }
+
+            start.countDown();
+            factory.close();
+            done.await();
+
+            assertThat(unexpected.get()).isNull();
         }
     }
 

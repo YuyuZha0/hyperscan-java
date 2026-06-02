@@ -21,6 +21,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
@@ -89,6 +90,11 @@ public final class ScopedPatternFilterFactory<T> implements Supplier<ScopedPatte
     // --- Instance-specific fields ---
     private final ReferenceQueue<ScopedPatternFilter<?>> referenceQueue = new ReferenceQueue<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
+
+    // Guards the shared database's lifecycle: filter creation (which allocates scratch over the
+    // database) takes the read lock, while close() takes the write lock to free it. This prevents
+    // a thread from allocating scratch over a database that close() is concurrently releasing.
+    private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
 
     @Getter(AccessLevel.PACKAGE)
     @SuppressWarnings("MismatchedQueryAndUpdateOfCollection")
@@ -213,11 +219,22 @@ public final class ScopedPatternFilterFactory<T> implements Supplier<ScopedPatte
         if (database == null) {
             return null;
         }
-        ScopedPatternFilterImpl<T> filter = new ScopedPatternFilterImpl<>(database, closed, filterable, notFilterable);
-        // Use this instance's referenceQueue.
-        PatternFilterCleaner cleaner = new PatternFilterCleaner(filter, referenceQueue);
-        refKeeper.add(cleaner);
-        return filter;
+        // Hold the read lock so the database cannot be freed by close() while we allocate scratch
+        // over it. Re-check closed under the lock: if close() won the race, refuse to create a
+        // filter over the now-defunct database instead of crashing in allocScratch.
+        lifecycleLock.readLock().lock();
+        try {
+            if (closed.get()) {
+                throw new IllegalStateException("This ScopedPatternFilterFactory has already been closed.");
+            }
+            ScopedPatternFilterImpl<T> filter = new ScopedPatternFilterImpl<>(database, closed, filterable, notFilterable);
+            // Use this instance's referenceQueue.
+            PatternFilterCleaner cleaner = new PatternFilterCleaner(filter, referenceQueue);
+            refKeeper.add(cleaner);
+            return filter;
+        } finally {
+            lifecycleLock.readLock().unlock();
+        }
     }
 
     /**
@@ -263,22 +280,31 @@ public final class ScopedPatternFilterFactory<T> implements Supplier<ScopedPatte
             if (cleanerTaskFuture != null) {
                 this.cleanerTaskFuture.cancel(false);
             }
-            // Close every live filter's scanner before freeing the shared database. Each close action
-            // synchronizes on its scanner, so it waits out any in-flight scan (and the closed flag set
-            // above blocks new ones) — guaranteeing no scan can touch the database once we free it.
-            PatternFilterCleaner[] cleaners;
-            synchronized (refKeeper) {
-                cleaners = refKeeper.toArray(new PatternFilterCleaner[0]);
+            // Take the write lock so teardown cannot overlap with createFilter()'s allocScratch over
+            // the shared database. Any in-flight creation finishes first; any creation that starts
+            // after this sees closed == true and bails out.
+            lifecycleLock.writeLock().lock();
+            try {
+                // Close every live filter's scanner before freeing the shared database. Each close
+                // action synchronizes on its scanner, so it waits out any in-flight scan (and the
+                // closed flag set above blocks new ones) — guaranteeing no scan can touch the
+                // database once we free it.
+                PatternFilterCleaner[] cleaners;
+                synchronized (refKeeper) {
+                    cleaners = refKeeper.toArray(new PatternFilterCleaner[0]);
+                }
+                for (PatternFilterCleaner cleaner : cleaners) {
+                    cleaner.clean();
+                }
+                // All scanners (and their scratch) are now closed; release the shared native database.
+                if (database != null) {
+                    database.close();
+                }
+                cleanUp();
+                refKeeper.clear();
+            } finally {
+                lifecycleLock.writeLock().unlock();
             }
-            for (PatternFilterCleaner cleaner : cleaners) {
-                cleaner.clean();
-            }
-            // All scanners (and their scratch) are now closed; release the shared native database.
-            if (database != null) {
-                database.close();
-            }
-            cleanUp();
-            refKeeper.clear();
         }
     }
 
