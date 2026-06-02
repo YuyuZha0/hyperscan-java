@@ -203,7 +203,10 @@ public final class ScopedPatternFilterFactory<T> implements Supplier<ScopedPatte
 
 
     // This is an instance method that knows about this instance's queue and refKeeper.
+    // Holds the read lock so its scanner closes and refKeeper removals cannot overlap close()'s
+    // teardown (which holds the write lock and frees the shared database).
     private void cleanUp() {
+        lifecycleLock.readLock().lock();
         try {
             PatternFilterCleaner ref;
             while ((ref = (PatternFilterCleaner) referenceQueue.poll()) != null) {
@@ -212,6 +215,8 @@ public final class ScopedPatternFilterFactory<T> implements Supplier<ScopedPatte
             }
         } catch (Exception e) {
             // Log or handle exception
+        } finally {
+            lifecycleLock.readLock().unlock();
         }
     }
 
@@ -285,22 +290,19 @@ public final class ScopedPatternFilterFactory<T> implements Supplier<ScopedPatte
             // after this sees closed == true and bails out.
             lifecycleLock.writeLock().lock();
             try {
-                // Close every live filter's scanner before freeing the shared database. Each close
-                // action synchronizes on its scanner, so it waits out any in-flight scan (and the
-                // closed flag set above blocks new ones) — guaranteeing no scan can touch the
-                // database once we free it.
-                PatternFilterCleaner[] cleaners;
-                synchronized (refKeeper) {
-                    cleaners = refKeeper.toArray(new PatternFilterCleaner[0]);
-                }
-                for (PatternFilterCleaner cleaner : cleaners) {
+                // The write lock excludes createFilter() and cleanUp() (both read-lock holders), so
+                // refKeeper is structurally stable here and can be iterated directly. Close every
+                // live filter's scanner before freeing the shared database: each close action
+                // synchronizes on its scanner, so it waits out any in-flight scan (and the closed
+                // flag set above blocks new ones) — guaranteeing no scan can touch the database once
+                // we free it.
+                for (PatternFilterCleaner cleaner : refKeeper) {
                     cleaner.clean();
                 }
                 // All scanners (and their scratch) are now closed; release the shared native database.
                 if (database != null) {
                     database.close();
                 }
-                cleanUp();
                 refKeeper.clear();
             } finally {
                 lifecycleLock.writeLock().unlock();
